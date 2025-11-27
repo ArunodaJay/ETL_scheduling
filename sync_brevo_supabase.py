@@ -40,7 +40,6 @@ if not BREVO_API_KEY or not SUPABASE_HOST or not SUPABASE_PASSWORD:
 def get_db_connection():
     """Establishes a connection to the Supabase PostgreSQL database."""
     try:
-        # Standard connection - Works perfectly with the Pooler URL (Port 6543)
         conn = psycopg2.connect(
             host=SUPABASE_HOST,
             database=SUPABASE_DB,
@@ -97,7 +96,7 @@ def fetch_brevo_data(day_str):
                     # 2. HANDLE OTHER ERRORS
                     if r.status_code != 200:
                         logger.error(f"API Error {r.status_code}: {r.text}")
-                        return all_events # Stop and return what we have so far
+                        return all_events 
                     
                     # If success
                     success = True
@@ -125,7 +124,7 @@ def fetch_brevo_data(day_str):
                 
             offset += 500
             page_count += 1
-            time.sleep(1) # Increase polite delay slightly
+            time.sleep(1) 
             
         return all_events
         
@@ -218,7 +217,6 @@ def get_last_loaded_date(conn):
         cur.execute(f"SELECT MAX(date) FROM {TABLE_NAME}")
         result = cur.fetchone()[0]
         if result:
-            logger.info(f"Last loaded date found: {result}")
             return result
         return None
     except Exception as e:
@@ -258,48 +256,96 @@ def load_data_to_supabase(conn, df):
     finally:
         cur.close()
 
+# --- NEW FUNCTION: Smart Date Calculation ---
+def get_dates_to_process(conn):
+    """
+    Generates a unique, sorted list of dates that need fetching.
+    Combines: New dates + Safety buffer + Zero-day repairs.
+    """
+    dates_to_fetch = set()
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+    
+    last_loaded = get_last_loaded_date(conn)
+    
+    # 1. New Dates / Fresh Start
+    if last_loaded is None:
+        start_date = datetime.strptime(INITIAL_START_DATE, "%Y-%m-%d").date()
+        current = start_date
+        while current <= yesterday:
+            dates_to_fetch.add(current)
+            current += timedelta(days=1)
+    else:
+        start_seq = last_loaded + timedelta(days=1)
+        current = start_seq
+        while current <= yesterday:
+            dates_to_fetch.add(current)
+            current += timedelta(days=1)
+
+    # 2. The "Safety Buffer" (Last 3 days for delayed updates)
+    if last_loaded:
+        buffer_days = 3
+        for i in range(buffer_days):
+            d = last_loaded - timedelta(days=i)
+            # Ensure we don't go back further than our project start
+            if d >= datetime.strptime(INITIAL_START_DATE, "%Y-%m-%d").date():
+                dates_to_fetch.add(d)
+
+    # 3. The "Zero Patrol" (Check last 14 days for suspicious 0s)
+    cur = conn.cursor()
+    try:
+        cur.execute(f"""
+            SELECT date FROM {TABLE_NAME} 
+            WHERE sent = 0 
+            AND date >= CURRENT_DATE - INTERVAL '14 days'
+        """)
+        zero_rows = cur.fetchall()
+        for row in zero_rows:
+            dates_to_fetch.add(row[0])
+            logger.info(f"Flagged suspicious zero-day for re-check: {row[0]}")
+    except Exception as e:
+        logger.warning(f"Could not check for zero-days: {e}")
+    finally:
+        cur.close()
+
+    # Filter out future dates (just in case)
+    valid_dates = [d for d in dates_to_fetch if d <= yesterday]
+    
+    return sorted(valid_dates)
+
 # --- Main ETL ---
 def main():
-    logger.info("Starting Brevo to Supabase ETL.")
+    logger.info("Starting Brevo to Supabase ETL (Production Mode).")
     conn = None 
     try:
         conn = get_db_connection()
         ensure_table_exists(conn)
-        
-        last_date = get_last_loaded_date(conn)
-        
-        if last_date is None:
-            # Parse your INITIAL_START_DATE string to a date object
-            start_date = datetime.strptime(INITIAL_START_DATE, "%Y-%m-%d").date()
-            logger.info(f"Table empty. Starting from scratch: {start_date}")
-        else:
-            start_date = last_date + timedelta(days=1)
-            
-        end_date = datetime.now().date() - timedelta(days=1)
 
-        if start_date > end_date:
-            logger.info("Data is already up to date. Exiting.")
+        # 1. Get the Intelligent List of Dates
+        final_date_list = get_dates_to_process(conn)
+        
+        if not final_date_list:
+            logger.info("Data is perfectly up to date. No actions needed.")
             return
 
-        logger.info(f"Fetching data from {start_date} to {end_date}.")
-        
-        current = start_date
-        while current <= end_date:
-            day_str = current.strftime("%Y-%m-%d")
+        logger.info(f"Processing schedule: {len(final_date_list)} days to sync.")
+        logger.info(f"Range: {final_date_list[0]} to {final_date_list[-1]}")
+
+        # 2. Process Loop
+        for current_date in final_date_list:
+            day_str = current_date.strftime("%Y-%m-%d")
             logger.info(f"Processing {day_str}...")
             
-            # 1. Get Data for ONE day
+            # Fetch
             df_day = get_metrics_df(day_str)
             
-            # 2. Save IMMEDIATELY to Supabase
-            # This ensures that if the script crashes on day 5, days 1-4 are already saved.
+            # Upsert (Will overwrite 0s with real numbers if they exist now)
             if not df_day.empty:
                 load_data_to_supabase(conn, df_day)
             
+            # 3. API Pause (Crucial for avoiding 429 errors)
             logger.info("Taking a 10s break to respect API limits...")
-            time.sleep(10)
-            # Move to next day
-            current += timedelta(days=1)
+            time.sleep(10) 
             
     except Exception as e:
         logger.critical(f"Critical error: {e}", exc_info=True)
